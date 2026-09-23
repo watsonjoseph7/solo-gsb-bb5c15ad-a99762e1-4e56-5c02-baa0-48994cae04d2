@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .analyzer import ValidationError, normalize_action
+from .change_guard import GUARD_ACTIONS
 
 
 class RuleIn(BaseModel):
@@ -94,6 +95,49 @@ class SimulateRequest(BaseModel):
         if not isinstance(v, list):
             raise ValueError("must be a list of operations")
         return v
+
+
+class GuardEntryIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cidr: str = Field(
+        ..., description="Strict IPv4/IPv6 CIDR: explicit prefix length, host bits must be zero"
+    )
+    from_action: str = Field(..., description="permit / deny / none")
+    to_action: str = Field(..., description="permit / deny / none; must differ from from_action")
+
+    @field_validator("cidr")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("from_action", "to_action")
+    @classmethod
+    def _normalize_guard_action(cls, v: str) -> str:
+        key = v.strip().lower()
+        if key not in GUARD_ACTIONS:
+            raise ValueError("must be one of permit, deny, none")
+        return key
+
+    @model_validator(mode="after")
+    def _transition_must_differ(self) -> "GuardEntryIn":
+        if self.from_action == self.to_action:
+            raise ValueError("from_action and to_action must differ")
+        return self
+
+
+class ChangeGuardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authorizations: list[GuardEntryIn] = Field(
+        ...,
+        min_length=1,
+        description="Granted action transitions; same-transition CIDRs are unioned, "
+        "overlapping CIDRs of different transitions are rejected",
+    )
 
 
 class ListAnalysesResponse(BaseModel):

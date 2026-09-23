@@ -11,6 +11,7 @@ GET    /api/analyses/{id}/findings           query findings (filters: severity/b
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
+POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
 GET    /health                               liveness probe
 """
 
@@ -27,9 +28,10 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
+from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
-from .schemas import AnalyzeRequest, SimulateRequest
+from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -69,6 +71,15 @@ async def _patch_error_handler(_request, exc: PatchError):
 @app.exception_handler(DecisionMapError)
 async def _decision_map_error_handler(_request, exc: DecisionMapError):
     return JSONResponse(status_code=400, content={"error": "invalid_cidr", "detail": str(exc)})
+
+
+@app.exception_handler(ChangeGuardError)
+async def _change_guard_error_handler(_request, exc: ChangeGuardError):
+    # The whole authorization set is rejected; every problem is reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_change_guard", "detail": str(exc), "issues": exc.issues},
+    )
 
 
 def _make_id(ruleset_hash: str) -> str:
@@ -238,16 +249,8 @@ def export_analysis(analysis_id: str) -> Response:
     )
 
 
-@app.get("/api/analyses/{base_id}/diff/{target_id}")
-def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
-    """Compare final effective actions of two saved versions.
-
-    Every address covered by either version is classified by its effective
-    action in each version (``permit``/``deny``, ``none`` when no rule
-    matches).  Only addresses whose action changed are returned, as minimal
-    CIDR ranges grouped by the six change types; adjacent ranges of the same
-    type are merged.
-    """
+def _validate_analysis_id_pair(base_id: str, target_id: str) -> None:
+    """Format/identity checks shared by the diff and change-guard endpoints."""
     bad = [i for i in (base_id, target_id) if not ANALYSIS_ID_RE.match(i)]
     if bad:
         raise HTTPException(
@@ -258,6 +261,19 @@ def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
     if base_id == target_id:
         raise HTTPException(status_code=400, detail="base and target ids must differ")
 
+
+@app.get("/api/analyses/{base_id}/diff/{target_id}")
+def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
+    """Compare final effective actions of two saved versions.
+
+    Every address covered by either version is classified by its effective
+    action in each version (``permit``/``deny``, ``none`` when no rule
+    matches).  Only addresses whose action changed are returned, as minimal
+    CIDR ranges grouped by the six change types; adjacent ranges of the same
+    type are merged.
+    """
+    _validate_analysis_id_pair(base_id, target_id)
+
     base = db.get_analysis(base_id)
     if base is None:
         raise HTTPException(status_code=404, detail=f"analysis '{base_id}' not found")
@@ -266,3 +282,32 @@ def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
 
     return diff_analyses(base, target)
+
+
+@app.post("/api/analyses/{base_id}/change-guard/{target_id}", status_code=200)
+def change_guard_versions(base_id: str, target_id: str, req: ChangeGuardRequest) -> dict[str, Any]:
+    """Authorize the base→target semantic diff against caller-supplied grants.
+
+    Each authorization entry grants one action transition
+    (``permit``/``deny``/``none`` → a *different* one) on one strict CIDR.
+    A changed address is authorized only when covered by a grant of the same
+    IP family and the same transition; grants of one transition are unioned
+    (nesting/duplicates allowed), while overlapping grants of different
+    transitions are rejected with ``400``.  The response reports ``passed``
+    and, per transition, the unauthorized surface as minimal CIDRs with exact
+    address counts.  Nothing is persisted.
+    """
+    _validate_analysis_id_pair(base_id, target_id)
+
+    # The authorization set is validated before the versions are looked up,
+    # mirroring the decision-map endpoint's format-before-existence ordering.
+    grants = parse_guard_entries([e.model_dump() for e in req.authorizations])
+
+    base = db.get_analysis(base_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{base_id}' not found")
+    target = db.get_analysis(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
+
+    return guard_changes(base, target, grants)

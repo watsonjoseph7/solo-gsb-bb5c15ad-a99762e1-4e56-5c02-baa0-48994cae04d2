@@ -101,6 +101,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/decision-map?cidr=...` | 只读的 **CIDR 决策地图**：把查询网段切成最小 CIDR 分块，给出最终动作/胜出规则/完整匹配链 |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
+| POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
 | GET | `/health` | 健康检查 |
 
 ### 示例：提交分析
@@ -405,6 +406,85 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 - ID 格式非法（不是 `an_` + 16 个小写十六进制字符）或两个 ID 相同 → `400`；
 - 任一版本不存在 → `404`（先做格式/同一性校验，再查存在性）。
 
+### 变更守卫（change guard）
+
+`POST /api/analyses/{base}/change-guard/{target}` 在**版本语义差异**之上加一层授权核对：
+请求体给出一组**授权条目**，服务端逐段检查 base→target 的每一处生效动作变化是否都落在
+被授权的范围内，**不新建分析、不写库**。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-guard/an_e72f1fd559c70442 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "authorizations": [
+      {"cidr": "10.1.0.0/16", "from_action": "permit", "to_action": "deny"}
+    ]
+  }'
+```
+
+每个授权条目：
+
+| 字段 | 说明 |
+| --- | --- |
+| `cidr` | **严格 CIDR**：必须显式带前缀长度、主机位为 0（`10.0.0.5/24`、`10.0.0.0` 都会被拒绝） |
+| `from_action` / `to_action` | `permit` / `deny` / `none`（`none` = 无任何规则命中），大小写不敏感；**两者必须不同**（授权描述的是一次"变化"） |
+
+核对语义：
+
+- 地址发生动作变化时，只有落在**同 IP 家族且同动作转换**（`from_action`/`to_action` 完全一致）
+  的授权 CIDR 内才算获准；IPv4 授权不能覆盖 IPv6 变化，`permit→deny` 的授权不能覆盖
+  `deny→permit` 的变化；
+- **同类**（同转换）授权可以随意嵌套、重复——按**并集**计算（相邻兄弟块也会合并）；
+- **异类**授权的 CIDR 相互重叠（包含或相等）→ 整个请求 `400 invalid_change_guard`，
+  `issues` 一次性列出全部问题；
+- **没有发生变化的地址不需要授权**：授权条目覆盖了未变化区域不算违规，未被任何变化用到的
+  授权条目直接忽略。
+
+响应（上例：v1 = `permit 10.0.0.0/8`，v2 = `deny 10.1.0.0/16` + `permit 10.1.1.0/24`，
+只授权了 `permit→deny`）：
+
+```json
+{
+  "base":   {"id": "an_0a34...", "ruleset_hash": "0a34...", "analyzer_version": "1.0.0"},
+  "target": {"id": "an_e72f...", "ruleset_hash": "e72f...", "analyzer_version": "1.0.0"},
+  "passed": false,
+  "violations": [
+    {
+      "ip_version": 4,
+      "change_type": "permit_to_none",
+      "from_action": "permit", "to_action": null,
+      "unauthorized_address_count": 16711680,
+      "unauthorized_range_count": 8,
+      "unauthorized_cidrs": ["10.0.0.0/16", "10.2.0.0/15", "10.4.0.0/14", "..."]
+    }
+  ],
+  "summary": {
+    "authorization_entries": 1,
+    "total_changed_addresses": 16776960,
+    "total_authorized_addresses": 65280,
+    "total_unauthorized_addresses": 16711680,
+    "total_violation_groups": 1,
+    "ipv4": {"changed_addresses": 16776960, "unauthorized_addresses": 16711680,
+             "violation_groups": 1, "by_type": {"permit_to_deny": 0, "permit_to_none": 16711680, "...": 0}},
+    "ipv6": {"changed_addresses": 0, "unauthorized_addresses": 0, "violation_groups": 0, "by_type": {"...": 0}}
+  }
+}
+```
+
+- `passed`：全部变化均被授权时为 `true`；
+- `violations`：按转换类型分组的**未授权**范围——最小 CIDR 列表（`unauthorized_cidrs`）、
+  精确地址数（`unauthorized_address_count`，IPv6 大整数精确给出）与段数；只列出确有未授权
+  地址的转换，顺序与 diff 的六种变化类型一致；
+- `summary`：变化/已授权/未授权地址总数，IPv4/IPv6 各自独立汇总（`by_type` 含全部六种转换）。
+
+与 diff 一样，全部计算都是 CIDR 几何运算，不逐地址枚举，IPv6 全空间也能精确处理。错误码：
+
+- ID 格式非法或两个 ID 相同 → `400`（先校验 ID，再校验授权条目，最后查存在性）；
+- 授权 CIDR 非法、异类授权相互重叠 → `400`，形如
+  `{"error": "invalid_change_guard", "detail": "...", "issues": ["...全部问题..."]}`；
+- 字段层面错误（`from_action == to_action`、未知动作、空 `authorizations`、多余字段等）→ `422`；
+- 任一版本不存在 → `404`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
@@ -414,6 +494,8 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
   `{"error": "invalid_simulation", "detail": "...", "issues": ["...全部问题..."]}`
 - 决策地图 CIDR 查询非法（主机位非零、缺前缀长度等）→ `400`，形如
   `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
+- 变更守卫授权集非法（授权 CIDR 非严格 CIDR、异类授权相互重叠等）→ `400`，形如
+  `{"error": "invalid_change_guard", "detail": "...", "issues": ["...全部问题..."]}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
 
@@ -427,6 +509,7 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 │   ├── __init__.py
 │   ├── analyzer.py      # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
 │   ├── diff.py          # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
+│   ├── change_guard.py  # 变更守卫：授权条目解析/并集/重叠校验 + 未授权范围切割（纯函数，可独立使用）
 │   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
@@ -434,6 +517,7 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 │   └── main.py          # FastAPI 路由
 ├── tests/test_api.py           # 端到端测试（pytest + TestClient）
 ├── tests/test_diff.py          # 语义差异端点测试
+├── tests/test_change_guard.py  # 变更守卫端点测试
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── requirements.txt
