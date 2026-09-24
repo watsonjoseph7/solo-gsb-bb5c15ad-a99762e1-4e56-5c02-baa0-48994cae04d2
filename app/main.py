@@ -11,6 +11,7 @@ GET    /api/analyses/{id}/findings           query findings (filters: severity/b
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
+POST   /api/analyses/{id}/change-guard/{oid} authorize effective-action transitions of two versions
 GET    /health                               liveness probe
 """
 
@@ -29,7 +30,8 @@ from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
-from .schemas import AnalyzeRequest, SimulateRequest
+from .guard import GuardError, build_change_guard
+from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -69,6 +71,16 @@ async def _patch_error_handler(_request, exc: PatchError):
 @app.exception_handler(DecisionMapError)
 async def _decision_map_error_handler(_request, exc: DecisionMapError):
     return JSONResponse(status_code=400, content={"error": "invalid_cidr", "detail": str(exc)})
+
+
+@app.exception_handler(GuardError)
+async def _guard_error_handler(_request, exc: GuardError):
+    # The whole authorization batch is rejected; every offending entry /
+    # overlapping pair is reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_change_guard", "detail": str(exc), "issues": exc.issues},
+    )
 
 
 def _make_id(ruleset_hash: str) -> str:
@@ -266,3 +278,40 @@ def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
 
     return diff_analyses(base, target)
+
+
+@app.post("/api/analyses/{base_id}/change-guard/{target_id}", status_code=200)
+def change_guard(base_id: str, target_id: str, req: ChangeGuardRequest) -> dict[str, Any]:
+    """Authorize the effective-action transition of two saved versions.
+
+    Every authorization entry grants one exact transition
+    (``from_action`` -> ``to_action`` in ``permit``/``deny``/``none``) over a
+    strict CIDR.  The two versions' effective-action diff is checked segment
+    by segment: a changed address is allowed only inside a same-family entry
+    declaring the very transition it underwent.  Same-transition entries
+    combine by union (nesting/duplicates accumulate); entries declaring
+    different transitions may not overlap (``400``).  Unchanged areas are never
+    violations.  The response reports ``passed`` plus the minimal unauthorized
+    CIDRs and exact address counts per transition.
+    """
+    bad = [i for i in (base_id, target_id) if not ANALYSIS_ID_RE.match(i)]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid analysis id format: {', '.join(sorted(set(bad)))}; "
+            "expected 'an_' followed by 16 lowercase hexadecimal characters",
+        )
+    if base_id == target_id:
+        raise HTTPException(status_code=400, detail="base and target ids must differ")
+
+    base = db.get_analysis(base_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{base_id}' not found")
+    target = db.get_analysis(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
+
+    # Structurally invalid entries (bad CIDR, equal/unknown actions) and
+    # cross-kind overlaps surface as one 400 invalid_change_guard response.
+    raw_authorizations = [a.model_dump() for a in req.authorizations]
+    return build_change_guard(base, target, raw_authorizations)

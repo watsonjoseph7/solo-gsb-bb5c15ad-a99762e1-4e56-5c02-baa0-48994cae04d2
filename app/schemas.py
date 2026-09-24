@@ -96,6 +96,54 @@ class SimulateRequest(BaseModel):
         return v
 
 
+class GuardAuthorization(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cidr: str = Field(..., description="Strict IPv4/IPv6 network; host bits must be zero")
+    from_action: str = Field(..., description="Expected base action: permit/deny/none")
+    to_action: str = Field(..., description="Expected target action: permit/deny/none")
+
+    @field_validator("cidr")
+    @classmethod
+    def _strip_cidr(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("from_action", "to_action")
+    @classmethod
+    def _normalize_guard_action(cls, v: str) -> str:
+        # Guard entries additionally accept ``none`` (no matching rule);
+        # semantic equality (from == to) is rejected by the guard service.
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("must be one of permit, deny, none")
+        text = v.strip().lower()
+        if text not in ("permit", "deny", "none"):
+            raise ValueError("must be one of permit, deny, none")
+        return text
+
+
+class ChangeGuardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authorizations: list[GuardAuthorization] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Authorized transitions; same-kind entries union (nesting/duplicates "
+            "allowed), different-kind entries must be disjoint"
+        ),
+    )
+
+    @field_validator("authorizations", mode="before")
+    @classmethod
+    def _must_be_list(cls, v: Any) -> Any:
+        if not isinstance(v, list):
+            raise ValueError("must be a list of authorization entries")
+        return v
+
+
 class ListAnalysesResponse(BaseModel):
     total: int
     analyses: list[dict[str, Any]]
